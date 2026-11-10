@@ -101,6 +101,17 @@ VOID_TASK_DECL_1(lddmc_gc_mark_rec, MDD)
 size_t lddmc_test_ismdd(MDD mdd);
 #endif
 
+/**
+ * Proof log (mebi_plugin): while open, union, minus, intersect, relprod
+ * and relprev record each result they compute, one file per worker
+ * (<prefix>.<worker>); at close, the nodes reachable from the records go
+ * to <prefix>.nodes. Garbage collection must be off while it is open (node
+ * indices name the nodes). lddmc_log_open returns 0 on failure;
+ * lddmc_log_close returns the number of records.
+ */
+int lddmc_log_open(const char *prefix);
+uint64_t lddmc_log_close(void);
+
 /* Operations for model checking */
 TASK_DECL_2(MDD, lddmc_union, MDD, MDD);
 #define lddmc_union(a, b) RUN(lddmc_union, a, b)

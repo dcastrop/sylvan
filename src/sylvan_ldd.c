@@ -27,6 +27,171 @@
 #include <sha2.h>
 
 /**
+ * Proof log (mebi_plugin, doc/no-computation.md, A).
+ *
+ * While open, union, minus, intersect, relprod and relprev write one
+ * record per result they compute (where they offer it to the cache):
+ * the operation, the case taken, the arguments as the cache sees them
+ * (after skipping), and the result. Each worker writes its own buffer
+ * and file (<prefix>.<worker>), so the hot path takes no lock. Nodes are
+ * named by their index in the table: the caller turns garbage collection
+ * off while the log is open, so indices are stable. At close, every node
+ * reachable from a recorded index is written to <prefix>.nodes.
+ */
+typedef struct {
+    uint8_t op, cas, pad[6];
+    uint64_t a, b, c, d, r;
+} ldd_log_rec;
+
+typedef struct {
+    uint64_t idx, down, right;
+    uint32_t value;
+    uint8_t copy, pad[3];
+} ldd_log_node;
+
+#define LDD_LOG_BUF 65536 /* records per buffer */
+
+static volatile int ldd_log_on = 0;
+static unsigned ldd_log_nbuf = 0;
+static ldd_log_rec **ldd_log_bufs = NULL;
+static size_t *ldd_log_lens = NULL;
+static FILE **ldd_log_files = NULL;
+static char *ldd_log_prefix = NULL;
+static uint64_t ldd_log_count = 0;
+
+static void
+ldd_log_flush(unsigned i)
+{
+    if (ldd_log_lens[i] == 0) return;
+    fwrite(ldd_log_bufs[i], sizeof(ldd_log_rec), ldd_log_lens[i], ldd_log_files[i]);
+    ldd_log_lens[i] = 0;
+}
+
+static inline void
+ldd_log(uint8_t op, uint8_t cas, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t r)
+{
+    if (!ldd_log_on) return;
+    WorkerP *w = lace_get_worker();
+    unsigned i = w != NULL ? w->worker : ldd_log_nbuf - 1;
+    if (i >= ldd_log_nbuf) i = ldd_log_nbuf - 1;
+    ldd_log_rec *e = &ldd_log_bufs[i][ldd_log_lens[i]];
+    e->op = op; e->cas = cas; memset(e->pad, 0, sizeof(e->pad));
+    e->a = a; e->b = b; e->c = c; e->d = d; e->r = r;
+    if (++ldd_log_lens[i] == LDD_LOG_BUF) ldd_log_flush(i);
+}
+
+int
+lddmc_log_open(const char *prefix)
+{
+    if (ldd_log_on) return 0;
+    ldd_log_nbuf = lace_workers() + 1; /* the workers, and any other thread */
+    ldd_log_bufs = calloc(ldd_log_nbuf, sizeof(ldd_log_rec*));
+    ldd_log_lens = calloc(ldd_log_nbuf, sizeof(size_t));
+    ldd_log_files = calloc(ldd_log_nbuf, sizeof(FILE*));
+    ldd_log_prefix = strdup(prefix);
+    size_t plen = strlen(prefix) + 32;
+    char *path = malloc(plen);
+    for (unsigned i = 0; i < ldd_log_nbuf; i++) {
+        ldd_log_bufs[i] = malloc(LDD_LOG_BUF * sizeof(ldd_log_rec));
+        snprintf(path, plen, "%s.%u", prefix, i);
+        ldd_log_files[i] = fopen(path, "wb");
+        if (ldd_log_bufs[i] == NULL || ldd_log_files[i] == NULL) {
+            free(path);
+            return 0;
+        }
+    }
+    free(path);
+    ldd_log_count = 0;
+    ldd_log_on = 1;
+    return 1;
+}
+
+/* the nodes reachable from [x] not yet written, written (an explicit
+   stack: an LDD can be deep) */
+static void
+ldd_log_nodes_from(uint64_t x, uint8_t *seen, uint64_t **stack, size_t *cap, FILE *f, uint64_t *count)
+{
+    size_t top = 0;
+    (*stack)[top++] = x;
+    while (top > 0) {
+        uint64_t y = (*stack)[--top];
+        if (y <= lddmc_true || (seen[y >> 3] & (1 << (y & 7)))) continue;
+        seen[y >> 3] |= (uint8_t)(1 << (y & 7));
+        mddnode_t n = LDD_GETNODE(y);
+        ldd_log_node e;
+        memset(&e, 0, sizeof(e));
+        e.idx = y; e.value = mddnode_getvalue(n); e.copy = mddnode_getcopy(n) ? 1 : 0;
+        e.down = mddnode_getdown(n); e.right = mddnode_getright(n);
+        fwrite(&e, sizeof(e), 1, f);
+        (*count)++;
+        if (top + 2 > *cap) {
+            *cap *= 2;
+            *stack = realloc(*stack, *cap * sizeof(uint64_t));
+        }
+        (*stack)[top++] = e.right;
+        (*stack)[top++] = e.down;
+    }
+}
+
+uint64_t
+lddmc_log_close(void)
+{
+    if (!ldd_log_on) return 0;
+    ldd_log_on = 0;
+    uint64_t records = 0;
+    for (unsigned i = 0; i < ldd_log_nbuf; i++) {
+        ldd_log_flush(i);
+        records += (uint64_t)ftell(ldd_log_files[i]) / sizeof(ldd_log_rec);
+        fclose(ldd_log_files[i]);
+        free(ldd_log_bufs[i]);
+    }
+    /* the nodes: every node reachable from an index the records mention */
+    size_t plen = strlen(ldd_log_prefix) + 32;
+    char *path = malloc(plen);
+    snprintf(path, plen, "%s.nodes", ldd_log_prefix);
+    FILE *nf = fopen(path, "wb");
+    size_t tsize = llmsset_get_size(nodes);
+    uint8_t *seen = calloc(tsize / 8 + 1, 1);
+    size_t cap = 4096;
+    uint64_t *stack = malloc(cap * sizeof(uint64_t));
+    uint64_t nnodes = 0;
+    ldd_log_rec *buf = malloc(LDD_LOG_BUF * sizeof(ldd_log_rec));
+    for (unsigned i = 0; i < ldd_log_nbuf && nf != NULL; i++) {
+        snprintf(path, plen, "%s.%u", ldd_log_prefix, i);
+        FILE *f = fopen(path, "rb");
+        if (f == NULL) continue;
+        size_t k;
+        while ((k = fread(buf, sizeof(ldd_log_rec), LDD_LOG_BUF, f)) > 0) {
+            for (size_t j = 0; j < k; j++) {
+                uint64_t ids[5] = { buf[j].a, buf[j].b, buf[j].c, buf[j].d, buf[j].r };
+                for (int t = 0; t < 5; t++) ldd_log_nodes_from(ids[t], seen, &stack, &cap, nf, &nnodes);
+            }
+        }
+        fclose(f);
+    }
+    if (nf != NULL) fclose(nf);
+    free(buf); free(stack); free(seen); free(path);
+    free(ldd_log_bufs); free(ldd_log_lens); free(ldd_log_files); free(ldd_log_prefix);
+    ldd_log_bufs = NULL; ldd_log_lens = NULL; ldd_log_files = NULL; ldd_log_prefix = NULL;
+    ldd_log_count = records;
+    return records;
+}
+
+/* the operations, as the log names them */
+#define LDD_LOG_UNION 1
+#define LDD_LOG_MINUS 2
+#define LDD_LOG_INTERSECT 3
+#define LDD_LOG_RELPROD 4
+#define LDD_LOG_RELPREV 5
+
+/* the cases of union and minus: the order of the two first values */
+static inline uint8_t
+ldd_log_cmp(uint32_t va, uint32_t vb)
+{
+    return va < vb ? 1 : (va == vb ? 2 : 3);
+}
+
+/**
  * Implementation of garbage collection
  */
 
@@ -563,6 +728,7 @@ TASK_IMPL_2(MDD, lddmc_union, MDD, a, MDD, b)
     }
 
     /* Write to cache */
+    ldd_log(LDD_LOG_UNION, (uint8_t)((na_copy ? 8 : 0) | (nb_copy ? 4 : 0) | ldd_log_cmp(na_value, nb_value)), a, b, 0, 0, result);
     if (cache_put3(CACHE_MDD_UNION, a, b, 0, result)) sylvan_stats_count(LDD_UNION_CACHEDPUT);
 
     return result;
@@ -611,6 +777,7 @@ TASK_IMPL_2(MDD, lddmc_minus, MDD, a, MDD, b)
     }
 
     /* Write to cache */
+    ldd_log(LDD_LOG_MINUS, ldd_log_cmp(na_value, nb_value), a, b, 0, 0, result);
     if (cache_put3(CACHE_MDD_MINUS, a, b, 0, result)) sylvan_stats_count(LDD_MINUS_CACHEDPUT);
 
     return result;
@@ -734,6 +901,7 @@ TASK_IMPL_2(MDD, lddmc_intersect, MDD, a, MDD, b)
     result = lddmc_makenode(na_value, down, right);
 
     /* Write to cache */
+    ldd_log(LDD_LOG_INTERSECT, 2, a, b, 0, 0, result);
     if (cache_put3(CACHE_MDD_INTERSECT, a, b, 0, result)) sylvan_stats_count(LDD_INTERSECT_CACHEDPUT);
 
     return result;
@@ -975,6 +1143,7 @@ TASK_IMPL_3(MDD, lddmc_relprod, MDD, set, MDD, rel, MDD, meta)
     }
 
     /* Write to cache */
+    ldd_log(LDD_LOG_RELPROD, (uint8_t)m_val, _set, _rel, meta, 0, result);
     if (cache_put3(CACHE_MDD_RELPROD, _set, _rel, meta, result)) sylvan_stats_count(LDD_RELPROD_CACHEDPUT);
 
     return result;
@@ -1545,6 +1714,7 @@ TASK_IMPL_4(MDD, lddmc_relprev, MDD, set, MDD, rel, MDD, meta, MDD, uni)
     }
 
     /* Write to cache */
+    ldd_log(LDD_LOG_RELPREV, (uint8_t)m_val, _set, _rel, meta, _uni, result);
     if (cache_put4(CACHE_MDD_RELPREV, _set, _rel, meta, _uni, result)) sylvan_stats_count(LDD_RELPREV_CACHEDPUT);
 
     return result;
