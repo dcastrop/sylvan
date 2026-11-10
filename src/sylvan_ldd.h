@@ -103,11 +103,12 @@ size_t lddmc_test_ismdd(MDD mdd);
 
 /**
  * Proof log (mebi_plugin): while open, union, minus, intersect, relprod
- * and relprev record each result they compute, one file per worker
- * (<prefix>.<worker>); at close, the nodes reachable from the records go
- * to <prefix>.nodes. Garbage collection must be off while it is open (node
- * indices name the nodes). lddmc_log_open returns 0 on failure;
- * lddmc_log_close returns the number of records.
+ * and relprev record each result they compute (one temporary file per
+ * worker, <path>.w<worker>); at close, one file <path> holds them and the
+ * nodes reachable from them ("MEBILOG1", the number of records, the
+ * records, the number of nodes, the nodes). Garbage collection must be off
+ * while it is open (node indices name the nodes). lddmc_log_open returns 0
+ * on failure; lddmc_log_close returns the number of records.
  */
 int lddmc_log_open(const char *prefix);
 uint64_t lddmc_log_close(void);

@@ -33,10 +33,12 @@
  * record per result they compute (where they offer it to the cache):
  * the operation, the case taken, the arguments as the cache sees them
  * (after skipping), and the result. Each worker writes its own buffer
- * and file (<prefix>.<worker>), so the hot path takes no lock. Nodes are
- * named by their index in the table: the caller turns garbage collection
- * off while the log is open, so indices are stable. At close, every node
- * reachable from a recorded index is written to <prefix>.nodes.
+ * and temporary file (<path>.w<worker>), so the hot path takes no lock.
+ * Nodes are named by their index in the table: the caller turns garbage
+ * collection off while the log is open, so indices are stable. At close,
+ * the one file <path> is written: the magic "MEBILOG1", the number of
+ * records (a 64-bit word), the records, the number of nodes, and every
+ * node reachable from a recorded index; the temporary files are removed.
  */
 typedef struct {
     uint8_t op, cas, pad[6];
@@ -56,7 +58,7 @@ static unsigned ldd_log_nbuf = 0;
 static ldd_log_rec **ldd_log_bufs = NULL;
 static size_t *ldd_log_lens = NULL;
 static FILE **ldd_log_files = NULL;
-static char *ldd_log_prefix = NULL;
+static char *ldd_log_path = NULL;
 static uint64_t ldd_log_count = 0;
 
 static void
@@ -84,16 +86,17 @@ int
 lddmc_log_open(const char *prefix)
 {
     if (ldd_log_on) return 0;
+    /* [prefix]: the log's path; the workers' files are [prefix.w<i>] */
     ldd_log_nbuf = lace_workers() + 1; /* the workers, and any other thread */
     ldd_log_bufs = calloc(ldd_log_nbuf, sizeof(ldd_log_rec*));
     ldd_log_lens = calloc(ldd_log_nbuf, sizeof(size_t));
     ldd_log_files = calloc(ldd_log_nbuf, sizeof(FILE*));
-    ldd_log_prefix = strdup(prefix);
+    ldd_log_path = strdup(prefix);
     size_t plen = strlen(prefix) + 32;
     char *path = malloc(plen);
     for (unsigned i = 0; i < ldd_log_nbuf; i++) {
         ldd_log_bufs[i] = malloc(LDD_LOG_BUF * sizeof(ldd_log_rec));
-        snprintf(path, plen, "%s.%u", prefix, i);
+        snprintf(path, plen, "%s.w%u", prefix, i);
         ldd_log_files[i] = fopen(path, "wb");
         if (ldd_log_bufs[i] == NULL || ldd_log_files[i] == NULL) {
             free(path);
@@ -145,34 +148,52 @@ lddmc_log_close(void)
         fclose(ldd_log_files[i]);
         free(ldd_log_bufs[i]);
     }
-    /* the nodes: every node reachable from an index the records mention */
-    size_t plen = strlen(ldd_log_prefix) + 32;
+    size_t plen = strlen(ldd_log_path) + 32;
     char *path = malloc(plen);
-    snprintf(path, plen, "%s.nodes", ldd_log_prefix);
-    FILE *nf = fopen(path, "wb");
+    /* the one file: header and records now, the nodes (collected into a
+       temporary file meanwhile, as they are found) after */
+    FILE *out = fopen(ldd_log_path, "wb");
+    snprintf(path, plen, "%s.n", ldd_log_path);
+    FILE *nf = fopen(path, "wb+");
     size_t tsize = llmsset_get_size(nodes);
     uint8_t *seen = calloc(tsize / 8 + 1, 1);
     size_t cap = 4096;
     uint64_t *stack = malloc(cap * sizeof(uint64_t));
     uint64_t nnodes = 0;
     ldd_log_rec *buf = malloc(LDD_LOG_BUF * sizeof(ldd_log_rec));
-    for (unsigned i = 0; i < ldd_log_nbuf && nf != NULL; i++) {
-        snprintf(path, plen, "%s.%u", ldd_log_prefix, i);
-        FILE *f = fopen(path, "rb");
-        if (f == NULL) continue;
-        size_t k;
-        while ((k = fread(buf, sizeof(ldd_log_rec), LDD_LOG_BUF, f)) > 0) {
-            for (size_t j = 0; j < k; j++) {
-                uint64_t ids[5] = { buf[j].a, buf[j].b, buf[j].c, buf[j].d, buf[j].r };
-                for (int t = 0; t < 5; t++) ldd_log_nodes_from(ids[t], seen, &stack, &cap, nf, &nnodes);
+    if (out != NULL && nf != NULL) {
+        fwrite("MEBILOG1", 1, 8, out);
+        fwrite(&records, sizeof(uint64_t), 1, out);
+        for (unsigned i = 0; i < ldd_log_nbuf; i++) {
+            snprintf(path, plen, "%s.w%u", ldd_log_path, i);
+            FILE *f = fopen(path, "rb");
+            if (f == NULL) continue;
+            size_t k;
+            while ((k = fread(buf, sizeof(ldd_log_rec), LDD_LOG_BUF, f)) > 0) {
+                fwrite(buf, sizeof(ldd_log_rec), k, out);
+                for (size_t j = 0; j < k; j++) {
+                    uint64_t ids[5] = { buf[j].a, buf[j].b, buf[j].c, buf[j].d, buf[j].r };
+                    for (int t = 0; t < 5; t++) ldd_log_nodes_from(ids[t], seen, &stack, &cap, nf, &nnodes);
+                }
             }
+            fclose(f);
+            remove(path);
         }
-        fclose(f);
+        fwrite(&nnodes, sizeof(uint64_t), 1, out);
+        rewind(nf);
+        ldd_log_node nb[1024];
+        size_t k;
+        while ((k = fread(nb, sizeof(ldd_log_node), 1024, nf)) > 0) fwrite(nb, sizeof(ldd_log_node), k, out);
     }
-    if (nf != NULL) fclose(nf);
+    if (nf != NULL) {
+        fclose(nf);
+        snprintf(path, plen, "%s.n", ldd_log_path);
+        remove(path);
+    }
+    if (out != NULL) fclose(out);
     free(buf); free(stack); free(seen); free(path);
-    free(ldd_log_bufs); free(ldd_log_lens); free(ldd_log_files); free(ldd_log_prefix);
-    ldd_log_bufs = NULL; ldd_log_lens = NULL; ldd_log_files = NULL; ldd_log_prefix = NULL;
+    free(ldd_log_bufs); free(ldd_log_lens); free(ldd_log_files); free(ldd_log_path);
+    ldd_log_bufs = NULL; ldd_log_lens = NULL; ldd_log_files = NULL; ldd_log_path = NULL;
     ldd_log_count = records;
     return records;
 }
