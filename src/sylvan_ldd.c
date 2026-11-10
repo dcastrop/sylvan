@@ -204,6 +204,16 @@ lddmc_log_close(void)
 #define LDD_LOG_INTERSECT 3
 #define LDD_LOG_RELPROD 4
 #define LDD_LOG_RELPREV 5
+#define LDD_LOG_TOP 6
+
+/* a call the caller made, with its role in the caller's proof: the case
+   is the role times 16 plus the operation's code; the arguments as the
+   caller passed them (before any skipping), and the result */
+void
+lddmc_log_top(int role, int op, MDD a, MDD b, MDD c, MDD d, MDD r)
+{
+    ldd_log(LDD_LOG_TOP, (uint8_t)((role << 4) | (op & 15)), a, b, c, d, r);
+}
 
 /* the cases of union and minus: the order of the two first values */
 static inline uint8_t

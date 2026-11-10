@@ -113,6 +113,15 @@ size_t lddmc_test_ismdd(MDD mdd);
 int lddmc_log_open(const char *prefix);
 uint64_t lddmc_log_close(void);
 
+/**
+ * Proof log: a call the caller made at the top level (op 6), with its role
+ * in the caller's proof (a number of the caller's, below 16) and the
+ * operation's code (4 relprod, 5 relprev, ...), its arguments as passed
+ * (before Sylvan skips any node) and its result; the nodes it names are
+ * written at close like any record's. Nothing while the log is closed.
+ */
+void lddmc_log_top(int role, int op, MDD a, MDD b, MDD c, MDD d, MDD r);
+
 /* Operations for model checking */
 TASK_DECL_2(MDD, lddmc_union, MDD, MDD);
 #define lddmc_union(a, b) RUN(lddmc_union, a, b)
