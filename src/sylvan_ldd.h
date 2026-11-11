@@ -109,9 +109,17 @@ size_t lddmc_test_ismdd(MDD mdd);
  * records, the number of nodes, the nodes). Garbage collection must be off
  * while it is open (node indices name the nodes). lddmc_log_open returns 0
  * on failure; lddmc_log_close returns the number of records.
+ *
+ * With no path (NULL), the log stays in memory: after close,
+ * lddmc_log_take copies up to max records (48 bytes each, as in the file)
+ * into dst and returns how many (0 at the end), freeing what it has
+ * handed out; the nodes are the table's (keep collection off until they
+ * are read); lddmc_log_free frees what is left.
  */
 int lddmc_log_open(const char *prefix);
 uint64_t lddmc_log_close(void);
+size_t lddmc_log_take(void *dst, size_t max);
+void lddmc_log_free(void);
 
 /**
  * Proof log: a call the caller made at the top level (op 6), with its role

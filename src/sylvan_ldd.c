@@ -39,6 +39,12 @@
  * the one file <path> is written: the magic "MEBILOG1", the number of
  * records (a 64-bit word), the records, the number of nodes, and every
  * node reachable from a recorded index; the temporary files are removed.
+ *
+ * In memory (no path): each worker keeps its full buffers in a list, and
+ * nothing is written. After close, lddmc_log_take hands the records out
+ * in the order the file would hold them, freeing each buffer once taken;
+ * the nodes are the table's own (collection still off); lddmc_log_free
+ * frees what is left.
  */
 typedef struct {
     uint8_t op, cas, pad[6];
@@ -60,11 +66,37 @@ static size_t *ldd_log_lens = NULL;
 static FILE **ldd_log_files = NULL;
 static char *ldd_log_path = NULL;
 static uint64_t ldd_log_count = 0;
+/* in memory: per worker, its full buffers; the next record to take */
+static int ldd_log_mem = 0;
+static ldd_log_rec ***ldd_log_blocks = NULL;
+static size_t *ldd_log_nblocks = NULL;
+static size_t *ldd_log_capblocks = NULL;
+static unsigned ldd_log_tw = 0; /* worker */
+static size_t ldd_log_tb = 0;   /* buffer (nblocks: the partial one) */
+static size_t ldd_log_to = 0;   /* record in it */
 
 static void
 ldd_log_flush(unsigned i)
 {
     if (ldd_log_lens[i] == 0) return;
+    if (ldd_log_mem) {
+        /* only a full buffer: the partial one stays where it is */
+        if (ldd_log_lens[i] < LDD_LOG_BUF) return;
+        if (ldd_log_nblocks[i] == ldd_log_capblocks[i]) {
+            size_t cap = ldd_log_capblocks[i] ? 2 * ldd_log_capblocks[i] : 16;
+            ldd_log_blocks[i] = realloc(ldd_log_blocks[i], cap * sizeof(ldd_log_rec*));
+            ldd_log_capblocks[i] = cap;
+        }
+        ldd_log_rec *fresh = malloc(LDD_LOG_BUF * sizeof(ldd_log_rec));
+        if (ldd_log_blocks[i] == NULL || fresh == NULL) {
+            fprintf(stderr, "proof log: out of memory\n");
+            exit(1);
+        }
+        ldd_log_blocks[i][ldd_log_nblocks[i]++] = ldd_log_bufs[i];
+        ldd_log_bufs[i] = fresh;
+        ldd_log_lens[i] = 0;
+        return;
+    }
     fwrite(ldd_log_bufs[i], sizeof(ldd_log_rec), ldd_log_lens[i], ldd_log_files[i]);
     ldd_log_lens[i] = 0;
 }
@@ -82,14 +114,34 @@ ldd_log(uint8_t op, uint8_t cas, uint64_t a, uint64_t b, uint64_t c, uint64_t d,
     if (++ldd_log_lens[i] == LDD_LOG_BUF) ldd_log_flush(i);
 }
 
+void lddmc_log_free(void);
+
 int
 lddmc_log_open(const char *prefix)
 {
     if (ldd_log_on) return 0;
-    /* [prefix]: the log's path; the workers' files are [prefix.w<i>] */
+    /* what an earlier log in memory left */
+    lddmc_log_free();
     ldd_log_nbuf = lace_workers() + 1; /* the workers, and any other thread */
     ldd_log_bufs = calloc(ldd_log_nbuf, sizeof(ldd_log_rec*));
     ldd_log_lens = calloc(ldd_log_nbuf, sizeof(size_t));
+    if (prefix == NULL) {
+        /* in memory */
+        ldd_log_blocks = calloc(ldd_log_nbuf, sizeof(ldd_log_rec**));
+        ldd_log_nblocks = calloc(ldd_log_nbuf, sizeof(size_t));
+        ldd_log_capblocks = calloc(ldd_log_nbuf, sizeof(size_t));
+        if (ldd_log_bufs == NULL || ldd_log_lens == NULL || ldd_log_blocks == NULL
+            || ldd_log_nblocks == NULL || ldd_log_capblocks == NULL) return 0;
+        for (unsigned i = 0; i < ldd_log_nbuf; i++) {
+            ldd_log_bufs[i] = malloc(LDD_LOG_BUF * sizeof(ldd_log_rec));
+            if (ldd_log_bufs[i] == NULL) return 0;
+        }
+        ldd_log_mem = 1;
+        ldd_log_count = 0;
+        ldd_log_on = 1;
+        return 1;
+    }
+    /* [prefix]: the log's path; the workers' files are [prefix.w<i>] */
     ldd_log_files = calloc(ldd_log_nbuf, sizeof(FILE*));
     ldd_log_path = strdup(prefix);
     size_t plen = strlen(prefix) + 32;
@@ -142,6 +194,13 @@ lddmc_log_close(void)
     if (!ldd_log_on) return 0;
     ldd_log_on = 0;
     uint64_t records = 0;
+    if (ldd_log_mem) {
+        for (unsigned i = 0; i < ldd_log_nbuf; i++)
+            records += (uint64_t)ldd_log_nblocks[i] * LDD_LOG_BUF + ldd_log_lens[i];
+        ldd_log_tw = 0; ldd_log_tb = 0; ldd_log_to = 0;
+        ldd_log_count = records;
+        return records;
+    }
     for (unsigned i = 0; i < ldd_log_nbuf; i++) {
         ldd_log_flush(i);
         records += (uint64_t)ftell(ldd_log_files[i]) / sizeof(ldd_log_rec);
@@ -196,6 +255,62 @@ lddmc_log_close(void)
     ldd_log_bufs = NULL; ldd_log_lens = NULL; ldd_log_files = NULL; ldd_log_path = NULL;
     ldd_log_count = records;
     return records;
+}
+
+/* a log in memory, closed: up to [max] records into [dst] (each as the
+   file holds it), each buffer freed once taken; 0 at the end */
+size_t
+lddmc_log_take(void *dst, size_t max)
+{
+    if (!ldd_log_mem || ldd_log_on) return 0;
+    ldd_log_rec *out = (ldd_log_rec *)dst;
+    size_t k = 0;
+    while (k < max && ldd_log_tw < ldd_log_nbuf) {
+        unsigned w = ldd_log_tw;
+        int partial = ldd_log_tb >= ldd_log_nblocks[w];
+        ldd_log_rec *b = partial ? ldd_log_bufs[w] : ldd_log_blocks[w][ldd_log_tb];
+        size_t len = partial ? ldd_log_lens[w] : LDD_LOG_BUF;
+        size_t n = len - ldd_log_to;
+        if (n > max - k) n = max - k;
+        memcpy(out + k, b + ldd_log_to, n * sizeof(ldd_log_rec));
+        k += n;
+        ldd_log_to += n;
+        if (ldd_log_to == len) {
+            /* this buffer taken */
+            if (partial) {
+                free(ldd_log_bufs[w]); ldd_log_bufs[w] = NULL; ldd_log_lens[w] = 0;
+                free(ldd_log_blocks[w]); ldd_log_blocks[w] = NULL;
+                ldd_log_nblocks[w] = 0; ldd_log_capblocks[w] = 0;
+                ldd_log_tw++; ldd_log_tb = 0;
+            } else {
+                free(ldd_log_blocks[w][ldd_log_tb]); ldd_log_blocks[w][ldd_log_tb] = NULL;
+                ldd_log_tb++;
+            }
+            ldd_log_to = 0;
+        }
+    }
+    return k;
+}
+
+/* a log in memory: everything it holds freed (closed first if open) */
+void
+lddmc_log_free(void)
+{
+    if (!ldd_log_mem) return;
+    ldd_log_on = 0;
+    for (unsigned i = 0; i < ldd_log_nbuf; i++) {
+        if (ldd_log_blocks != NULL && ldd_log_blocks[i] != NULL) {
+            for (size_t j = 0; j < ldd_log_nblocks[i]; j++) free(ldd_log_blocks[i][j]);
+            free(ldd_log_blocks[i]);
+        }
+        if (ldd_log_bufs != NULL) free(ldd_log_bufs[i]);
+    }
+    free(ldd_log_blocks); free(ldd_log_nblocks); free(ldd_log_capblocks);
+    free(ldd_log_bufs); free(ldd_log_lens);
+    ldd_log_blocks = NULL; ldd_log_nblocks = NULL; ldd_log_capblocks = NULL;
+    ldd_log_bufs = NULL; ldd_log_lens = NULL;
+    ldd_log_mem = 0;
+    ldd_log_tw = 0; ldd_log_tb = 0; ldd_log_to = 0;
 }
 
 /* the operations, as the log names them */
